@@ -1,0 +1,10 @@
+# runtime state
+logs/
+runs/
+data/
+*.log
+
+# python / editor cruft
+__pycache__/
+*.pyc
+.DS_Store
