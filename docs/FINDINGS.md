@@ -1,7 +1,7 @@
 # FINDINGS — GLM-5.3-Flash NVIDIA NVFP4 on 2× DGX Spark
 
-Everything here was measured on DragonCave (head, 192.168.0.8) + DragonForce
-(worker, 192.168.0.88), 2026-09-12/13, with the pilcothink `0.28` runtime.
+Everything here was measured on a 2-node GB10 cluster (head + worker over RoCE),
+2026-09-12/13, with the pilcothink `0.28` runtime.
 Numbers are the engine's own; where something is extrapolated it says so.
 
 ---
@@ -176,7 +176,7 @@ the launcher still printed "graphs ON". A whole night of "graph" runs was actual
   ```
   Bought 116.37 GiB free on the head, which is what let GMU 0.88 pass the gate.
 - **Image distribution: pull once, ship over the fabric** (`docker save | ssh docker load`,
-  RoCE 192.168.0.8↔.88). Never `docker pull` the same image per node.
+  RoCE fabric). Never `docker pull` the same image per node.
 - **`--kv-cache-memory` does not bypass the GMU gate** — the worker still runs
   `request_memory()` first. The pin only changes KV sizing, not the admission check.
 - **A failed boot tears down its own container.** Poll health *and* container existence

@@ -15,7 +15,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
-[ -f .env ] || { echo "[glm53f] missing .env — run: cp .env.example .env"; exit 1; }
+[ -f .env ] || { echo "[glm53f] missing .env — run: cp .env.sample .env"; exit 1; }
 set -a; . ./.env; set +a
 
 # --- optional keys / defaults -------------------------------------------------

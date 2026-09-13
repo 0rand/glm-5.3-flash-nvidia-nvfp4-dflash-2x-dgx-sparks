@@ -31,7 +31,7 @@ silently reserving ~2.1 GiB of KV, and batch/seqs were taking another ~2 GiB.
 ## Quickstart
 
 ```bash
-cp .env.example .env      # then edit the [EDIT] lines for your cluster
+cp .env.sample .env        # then edit the [EDIT] lines for your cluster — .env is gitignored
 ./download.sh             # image (once, then shipped over the fabric) + weights + draft
 ./start.sh                # boot, wait for health, print the KV pool
 ./run-tests.sh            # spec-bench x2 -> throughput -> hardmode
@@ -56,7 +56,8 @@ local-inference-lab weights instead, see the sibling stack below — those carry
 ## Layout
 
 ```
-.env / .env.example   all configuration; scripts contain no site values
+.env.sample            configuration template (sanitized); copy to .env — which is gitignored
+.env                   your real, site-specific config — never committed
 start.sh              boot both ranks, wait for health, report the pool
 stop.sh               stop both ranks
 status.sh             containers, health, served model, boot markers
