@@ -21,40 +21,24 @@ set -a; . ./.env; set +a
 # --- optional keys / defaults -------------------------------------------------
 : "${SERVED_MODEL_NAME:=}"; : "${ATTN_BACKEND:=}"; : "${KV_CACHE_MEMORY:=}"
 : "${RECIPE_SPEC_EXTRAS:=1}"; : "${ENFORCE_EAGER:=0}"; : "${CAPTURE_SIZE:=16}"
-: "${ASYNC_SCHED:=1}"; : "${ESTIMATE_CUDAGRAPHS:=0}"; : "${MIN_MEMAVAIL_GIB:=110}"
-: "${TOTAL_REF:=121.69}"; : "${CUDA_FREE_REF:=116}"; : "${K:=5}"; : "${CTX:=700160}"
-: "${GMU:=0.88}"; : "${SEQS:=4}"; : "${BATCH:=1024}"; : "${PORT:=8100}"
+: "${ASYNC_SCHED:=1}"; : "${ESTIMATE_CUDAGRAPHS:=0}"
+: "${K:=5}"; : "${CTX:=900096}"; : "${GMU:=0.88}"; : "${SEQS:=4}"; : "${BATCH:=1024}"; : "${PORT:=8100}"
 : "${MASTER_PORT:=29503}"; : "${CONTAINER:=glm53f-nvidia}"; : "${TP_SIZE:=2}"
 : "${WORKER_SSH_TARGET:=${WORKER_IP:-}}"; : "${DRAFT_MOUNT_DIR:=}"; : "${HF_CACHE:=}"
 : "${MODEL_REVISION:=main}"
 
 mkdir -p logs
 
-# --- preflight: GMU must fit CUDA-visible free memory -------------------------
-# On GB10 the runtime demands (GMU x TOTAL_REF) be FREE at engine init, before
-# weights load. This is a static guard; vLLM performs the real check.
-NEED=$(awk -v g="$GMU" -v t="$TOTAL_REF" 'BEGIN{printf "%.2f", g*t}')
-awk -v n="$NEED" -v f="$CUDA_FREE_REF" 'BEGIN{
-  if (n+0 > f+0) {
-    printf "ERROR: GMU %s needs %s GiB free but CUDA_FREE_REF is %s GiB.\n", ENVIRON["GMU"], n, f
-    printf "       Measure the real free memory at engine init, or lower GMU.\n"
-    exit 1
-  }
-}'
-
-# --- stop anything already holding the GPU, then let RAM come back -----------
+# --- stop anything already holding the GPU, then give RAM a moment to return ---
+# NO static memory preflight here, by design (Primo ruling 2026-09-13):
+#   a hardcoded CUDA_FREE_REF cannot know what is actually free at engine init, so a
+#   static guard only produces false aborts -- and it blocked boots that the engine
+#   itself would have accepted. vLLM performs the authoritative check, and when KV is
+#   short it names the largest context that does fit. Let the engine decide.
 echo "[glm53f] stopping existing $CONTAINER (both nodes)"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 [ -n "$WORKER_SSH_TARGET" ] && ssh -o BatchMode=yes "$WORKER_SSH_TARGET" "docker rm -f $CONTAINER" >/dev/null 2>&1 || true
-
-for _ in $(seq 1 30); do
-  avail=$(awk '/^MemAvailable:/{printf "%.1f", $2/1048576}' /proc/meminfo)
-  if awk -v a="$avail" -v m="$MIN_MEMAVAIL_GIB" 'BEGIN{exit !(a > m)}'; then
-    echo "  MemAvailable ${avail} GiB — ok"; break
-  fi
-  printf '  %s  MemAvailable %s GiB, waiting\n' "$(date '+%H:%M')" "$avail"
-  sleep 15
-done
+sleep 10
 
 # --- RoCE v2 IPv4 GID index (renumbers across reboots) -----------------------
 FIRST_HCA="${HCAS%%,*}"
@@ -122,13 +106,12 @@ GMU="$GMU" CTX="$CTX" SEQS="$SEQS" BATCH="$BATCH" K="$K" \
 KV_CACHE_MEMORY="$KV_CACHE_MEMORY" CONTAINER="$CONTAINER" \
 TP_SIZE="$TP_SIZE" ENFORCE_EAGER="$ENFORCE_EAGER" CAPTURE_SIZE="$CAPTURE_SIZE" \
 ASYNC_SCHED="$ASYNC_SCHED" ESTIMATE_CUDAGRAPHS="$ESTIMATE_CUDAGRAPHS" \
-CUDA_FREE_REF="$CUDA_FREE_REF" TOTAL_REF="$TOTAL_REF" \
 ATTN_BACKEND="$ATTN_BACKEND" RECIPE_SPEC_EXTRAS="$RECIPE_SPEC_EXTRAS" \
 SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
 SPEC_CONFIG="$SPEC_CONFIG" GID="$GID" SERVED_ARG="$SERVED_ARG" \
 ASYNC_ARG="$ASYNC_ARG" EAGER_ARG="$EAGER_ARG" CUDAGRAPH_ARGS="$CUDAGRAPH_ARGS" \
   bash "$HERE/vendor/run_cluster_dual.sh" "$IMAGE" "$HEAD_IP" \
-    --head "$HF_CACHE" --no-ray --workers "$WORKER_SSH_TARGET" \
+    --head "$HF_CACHE" --no-ray --workers "$WORKER_IP" \
     --master-port "$MASTER_PORT" --container-name "$CONTAINER" \
     --ipc=host --privileged --ulimit memlock=-1 --ulimit stack=67108864 \
     -e NCCL_SOCKET_IFNAME="$MN_IF" \
@@ -186,7 +169,7 @@ done
 
 curl -s --max-time 8 "$BASE/health" >/dev/null 2>&1 || {
   echo "ABORT: boot failed — $BLOG"
-  grep -aiE 'ValueError|RuntimeError|out of memory|not enough' "$BLOG" | tail -8
+  grep -aiE 'ValueError|RuntimeError|out of memory|not enough|less than desired GPU memory utilization' "$BLOG" | tail -8
   exit 1
 }
 

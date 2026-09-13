@@ -4,7 +4,32 @@ Serving **nvidia/GLM-5.3-Flash-NVFP4** (uniform NVFP4) with the pilcothink 0.28 
 on two GB10 nodes, TP=2 over RoCE, with a DFlash2 speculative draft, CUDA graphs and
 async scheduling — tuned for **long context**.
 
-## Verified result (2026-09-13)
+## Launch-verified 900K profile (2026-09-13)
+
+```
+context      : 900,096 tokens (3,516 x 256)
+KV pool      : 1,080,115 tokens (1.20x at full context)
+boot         : ~980 s to serving
+config       : GMU 0.88 · explicit 9 GiB KV · seqs 4 · batch 1024
+               cudagraphs <=16 · async ON · DFlash2 k=5
+API smoke    : HTTP 200, exact response "DRAGON ONLINE"
+throughput   : warmed pp1024/tg1024 c1 = 32.0 t/s decode
+               pp1024/tg512 c1 = 40.3 / 28.8 / 33.7 t/s at depth 0 / 2K / 8K
+```
+
+Boot evidence: `logs/boot-20260913-163451.log`. The 9 GiB KV allocation follows
+upstream's DFlash2 long-context profile. The local GMU is 0.88 because this image's
+admission check rejected 0.885 by 0.41 GiB while host services remained online.
+
+The earlier Gloo-looking failure was secondary: rank 1 was given
+`xraan@192.168.0.88` as a ZMQ bind address. `start.sh` now uses the bare
+`WORKER_IP` for cluster rendezvous while retaining `WORKER_SSH_TARGET` only for SSH.
+The vendored launcher remains byte-identical to upstream.
+
+No hardmode quality score has yet been run on the 900K profile. The 94/100 result
+below belongs to the prior 700,160-token profile and is not silently transferred.
+
+## Prior quality-verified result (2026-09-13)
 
 ```
 context      : 700,160 tokens (2,735 x 256)
