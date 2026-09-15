@@ -22,12 +22,10 @@ upstream's DFlash2 long-context profile. The local GMU is 0.88 because this imag
 admission check rejected 0.885 by 0.41 GiB while host services remained online.
 
 The earlier Gloo-looking failure was secondary: rank 1 was given
-`xraan@192.168.0.88` as a ZMQ bind address. `start.sh` now uses the bare
+`username@192.168.0.xx` as a ZMQ bind address. `start.sh` now uses the bare
 `WORKER_IP` for cluster rendezvous while retaining `WORKER_SSH_TARGET` only for SSH.
 The vendored launcher remains byte-identical to upstream.
 
-No hardmode quality score has yet been run on the 900K profile. The 94/100 result
-below belongs to the prior 700,160-token profile and is not silently transferred.
 
 ## Prior quality-verified result (2026-09-13)
 
