@@ -4,6 +4,81 @@ Serving **nvidia/GLM-5.3-Flash-NVFP4** (uniform NVFP4) with the pilcothink 0.28 
 on two GB10 nodes, TP=2 over RoCE, with a DFlash2 speculative draft, CUDA graphs and
 async scheduling — tuned for **long context**.
 
+## Launch-verified 1M profile (2026-09-22)
+
+```
+context      : 1,048,576 tokens (1 Mi) · kv fp8 · block 256
+KV pool      : 1,172,644 tokens production / 1,388,762 with display-KV (+216,118, +18.4%)
+config       : GMU 0.88 · 10,240,000,000-byte KV pin · seqs 4 · batch 1024
+               cudagraphs <=16 · async ON · DFlash2 k=5
+boot         : ~13 min to serving (190 GiB checkpoint load dominates)
+max concurrency at full 1M ctx : 1.12x production / 1.32x with display-KV
+```
+
+## Display-KV variant (EXPERIMENTAL — +18.4% KV, no decode tax)
+
+`start-display-kv.sh` is an alternative launcher that unlocks the ~2 GiB
+firmware-reserved display memory on headless GB10 nodes and uses it as KV-cache
+backing (technique and AGPL allocator by coolbho3k,
+https://github.com/coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark).
+
+Measured on this stack (2026-09-22, A/B, `runs/2026/09/2026-09-22*`):
+
+```
+KV pool            : 1,388,762 vs 1,172,644 tokens   (+216,118, +18.4%)
+max concurrency at 1M ctx : 1.32x vs 1.12x
+tool-eval hardmode : 91/100 (160/176, parallel 4, seed 42) — see runs
+                     2026-09-22T10-00-26 (88 scenarios, 0.0% error rate)
+```
+
+Throughput, display-KV active (tool-eval-bench v2.6.1, pp2048/tg256,
+sequential; run IDs in `runs/2026/09/`):
+
+| Test | pp t/s | tg t/s | TTFT (ms) |
+|---|---:|---:|---:|
+| depth 0 | 1,129 | 34.4 | 2,007 |
+| depth 2,048 | 970 | 27.9 | 4,420 |
+| depth 8,192 | 936 | 31.5 | 11,133 |
+| depth 65,384 | 793 | 31.3 | 85,228 |
+| depth 262,000 | 857 | 28.9 | 308,393 |
+
+Verdict: no decode tax within fluctuation — generation rates match the
+production profile's normal range, and the byte-matched fill run completed
+~100 s (~10%) faster, also within fluctuation. Prefill stays in the same band
+as prior runs on this iron (compare the 900K-profile table below).
+
+How to use:
+
+```bash
+./start-display-kv.sh preflight   # run tests, verify cluster state; touches nothing
+./start-display-kv.sh             # DRM reload + experimental boot
+```
+
+Requirements and behavior:
+
+- **Passwordless sudo on the WORKER node** (`<user> ALL=(ALL) NOPASSWD: ALL` in
+  `/etc/sudoers.d/` works) — the launcher applies the runtime DRM reload over SSH.
+  The local (head) node prompts for your sudo password once per boot; both nodes
+  need a sudo-capable user, but only the worker must be passwordless for a
+  fully unattended launch.
+- **Both nodes must be headless.** The technique requires
+  `nvidia_drm modeset=1 fbdev=0`, applied at runtime only — the launcher reloads
+  the module on both nodes at start. No `/etc/modprobe.d` changes, no initramfs
+  rebuild; a plain reboot restores the boot-default state.
+- The `display-kv/` directory ships the runtime shim (`display_kv_glm.py`,
+  `sitecustomize.py`, `libdisplay_kv_glm.so`), the vendored DRM toolkit
+  (`display-kv/toolkit/`) and the AGPL allocator source. The shim is
+  **fail-closed**: it SHA-pins the four vLLM files it hooks and aborts the boot
+  rather than silently degrading if the runtime image changes.
+- The pin stays at the production value: `KV_CACHE_MEMORY=10240000000` in `.env`
+  is required by the preflight (ordinary-RAM use never grows; only the KV budget
+  does, by +1.75 GiB/rank).
+
+What it is NOT: it does not add OS RAM or ordinary CUDA memory — `nvidia-smi`
+stays blind, `gpu_memory_utilization` is unchanged, and only the integrated
+allocator can address the carveout. Re-run `./run-tests.sh` after enabling to
+confirm quality on your own build; see `display-kv/README.md` for internals.
+
 ## Launch-verified 900K profile (2026-09-13)
 
 ```
@@ -71,6 +146,7 @@ cp .env.sample .env        # then edit the [EDIT] lines for your cluster — .en
 - `tool-eval-bench` on the head (for `run-tests.sh`)
 - The pilcothink runtime image — it supplies the `b12x` MoE/linear backends and the
   sparse-MLA attention default this recipe relies on
+- For `start-display-kv.sh` only: passwordless sudo on the worker (see above)
 
 The official NVFP4 checkpoint ships **no MTP heads** (0 `mtp`/`nextn` tensors in
 147,661), so a separate DFlash2 draft model is mandatory here. If you have the
@@ -82,6 +158,8 @@ local-inference-lab weights instead, see the sibling stack below — those carry
 .env.sample            configuration template (sanitized); copy to .env — which is gitignored
 .env                   your real, site-specific config — never committed
 start.sh              boot both ranks, wait for health, report the pool
+start-display-kv.sh   EXPERIMENTAL: +18.4% KV via the display-reserve unlock
+display-kv/           runtime shim + vendored DRM toolkit + AGPL allocator source
 stop.sh               stop both ranks
 status.sh             containers, health, served model, boot markers
 tail-log.sh           follow the boot log or the container log
@@ -100,6 +178,7 @@ logs/                 boot + test logs (gitignored)
   multi-node launcher and is not ours to rewrite.
 - Weights: NVIDIA official `nvidia/GLM-5.3-Flash-NVFP4`, revision-pinned in `.env`.
 - Draft: incoai `GLM-5.3-Flash-DFlash2`, mounted as `/workspace/models/<DRAFT_NAME>`.
+- Display-KV technique + allocator: coolbho3k (AGPL-3.0), see `display-kv/README.md`.
 - Related stack in this cluster: the local-inference-lab NVFP4 build (native MTP,
   eager, 900K ctx) — see the lab repo for that lineage.
 
