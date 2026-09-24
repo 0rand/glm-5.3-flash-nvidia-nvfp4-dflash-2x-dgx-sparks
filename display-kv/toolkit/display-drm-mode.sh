@@ -78,9 +78,17 @@ case "${1:-status}" in
     [ -d /sys/module/nvidia_drm ] || {
       echo "ERROR: nvidia_drm is not loaded after modprobe" >&2; exit 1;
     }
-    if [ ! -e /dev/dri/card1 ]; then
-      echo "ERROR: card1 missing after reload" >&2; exit 1
+    # The NVIDIA card is card0 or card1 depending on whether a firmware
+    # simple-framebuffer grabbed card0 first; find it by driver, not number.
+    nv_card=""
+    for c in /sys/class/drm/card[0-9]*; do
+      [ "$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)")" = nvidia ] \
+        && [ -e "/dev/dri/$(basename "$c")" ] && { nv_card=/dev/dri/$(basename "$c"); break; }
+    done
+    if [ -z "$nv_card" ]; then
+      echo "ERROR: no nvidia DRM card after reload" >&2; exit 1
     fi
+    echo "nvidia DRM card: $nv_card"
     echo "display mode ON (runtime only; reboot restores boot defaults)"
     ;;
   off)
