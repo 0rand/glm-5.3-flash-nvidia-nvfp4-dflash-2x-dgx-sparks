@@ -34,6 +34,10 @@ DISPLAY_KV_MEMORY=12119048192
 DISPLAY_KV_RUNTIME="$HERE/display-kv"
 DISPLAY_KV_TOOLKIT="${DISPLAY_KV_TOOLKIT:-$HERE/display-kv/toolkit}"
 WORKER_HOST="${WORKER_HOST:-$WORKER_SSH_TARGET}"
+# The NVIDIA card's /dev/dri/cardN number differs per node (a firmware
+# simple-framebuffer takes card0 on some boots). Address it by PCI path instead,
+# which is identical on every GB10; containers get the host's /dev/dri for it.
+: "${DISPLAY_KV_DRM_CARD:=/dev/dri/by-path/pci-000f:01:00.0-card}"
 
 [ "$ACTION" = start ] || [ "$ACTION" = preflight ] || {
   echo "usage: $0 [start|preflight]" >&2; exit 2;
@@ -70,7 +74,8 @@ bash -n "$0" "$DISPLAY_KV_TOOLKIT/display-drm-mode.sh" \
   "$DISPLAY_KV_TOOLKIT/prepare-display-drm-both.sh"
 python3 "$DISPLAY_KV_TOOLKIT/tests/test_display_kv_glm.py"
 ssh -o BatchMode=yes -o ConnectTimeout=8 "$WORKER_SSH_TARGET" \
-  'sudo -n true && test -e /dev/dri/card1'
+  'sudo -n true' \
+  || { echo "ERROR: worker needs passwordless sudo for the DRM reload" >&2; exit 1; }
 
 echo "[display-kv] preflight PASS: pin=$KV_CACHE_MEMORY ctx=$CTX k=$K"
 echo "[display-kv] experimental KV budget: $DISPLAY_KV_MEMORY (+$DISPLAY_KV_BYTES display)"
@@ -79,13 +84,24 @@ if [ "$ACTION" = preflight ]; then
 fi
 
 # Sync the tiny runtime + vendored DRM toolkit directly over SSH. No NFS.
+# Same absolute path on the worker: both ranks bind-mount it as /opt/display-kv.
+ssh -o BatchMode=yes "$WORKER_SSH_TARGET" "mkdir -p '$DISPLAY_KV_RUNTIME'" \
+  || { echo "ERROR: cannot create $DISPLAY_KV_RUNTIME on the worker" >&2; exit 1; }
 rsync -a --delete "$DISPLAY_KV_RUNTIME/" \
-  "$WORKER_SSH_TARGET:$DISPLAY_KV_RUNTIME/"
+  "$WORKER_SSH_TARGET:$DISPLAY_KV_RUNTIME/" \
+  || { echo "ERROR: display-kv runtime sync to the worker failed" >&2; exit 1; }
 
 # Runtime-only DRM reload. Local node may prompt for sudo once; the worker needs
 # passwordless sudo for the launcher to apply its reload remotely.
 WORKER_HOST="$WORKER_HOST" \
   "$DISPLAY_KV_TOOLKIT/prepare-display-drm-both.sh" on
+
+# Card existence is checked on both nodes after the DRM reload below.
+[ -e "$DISPLAY_KV_DRM_CARD" ] \
+  || { echo "ERROR: head: $DISPLAY_KV_DRM_CARD missing after reload" >&2; exit 1; }
+ssh -o BatchMode=yes "$WORKER_SSH_TARGET" "[ -e '$DISPLAY_KV_DRM_CARD' ]" \
+  || { echo "ERROR: worker: $DISPLAY_KV_DRM_CARD missing after reload" >&2; exit 1; }
+echo "[display-kv] DRM card: $DISPLAY_KV_DRM_CARD (head -> $(readlink -f "$DISPLAY_KV_DRM_CARD"), worker -> $(ssh -o BatchMode=yes "$WORKER_SSH_TARGET" "readlink -f '$DISPLAY_KV_DRM_CARD'"))"
 
 # Preserve the production ordinary allocation and add only the display suffix.
 KV_CACHE_MEMORY="$DISPLAY_KV_MEMORY"
@@ -178,13 +194,14 @@ ASYNC_ARG="$ASYNC_ARG" EAGER_ARG="$EAGER_ARG" CUDAGRAPH_ARGS="$CUDAGRAPH_ARGS" \
     --master-port "$MASTER_PORT" --container-name "$CONTAINER" \
     --ipc=host --privileged --ulimit memlock=-1 --ulimit stack=67108864 \
     -v "$DISPLAY_KV_RUNTIME:/opt/display-kv:ro" \
+    -v /dev/dri:/dev/dri \
     -e PYTHONPATH=/opt/display-kv \
     -e DISPLAY_KV_ENABLED=1 \
     -e DISPLAY_KV_MIN_TOTAL_BYTES=$((PRODUCTION_KV_MEMORY + 1)) \
     -e DISPLAY_KV_MAX_ORDINARY_BYTES="$PRODUCTION_KV_MEMORY" \
     -e DISPLAY_KV_LIBRARY=/opt/display-kv/libdisplay_kv_glm.so \
     -e DISPLAY_KV_RECEIPT_DIR=/tmp/display-kv-receipts \
-    -e DS41_DRM_CARD=/dev/dri/card1 \
+    -e DS41_DRM_CARD="$DISPLAY_KV_DRM_CARD" \
     -e DS41_ORDINARY_CAP_GIB=16 \
     -e NCCL_SOCKET_IFNAME="$MN_IF" \
     -e NCCL_IB_HCA="$HCAS" \
