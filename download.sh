@@ -32,7 +32,12 @@ set -a; . ./.env; set +a
 : "${MODEL_REVISION:=main}"
 
 CACHE_ENTRY="models--${MODEL_REPO//\//--}"
+SNAPSHOT="$HF_CACHE/hub/$CACHE_ENTRY/snapshots/$MODEL_REVISION"
 WORKER_WORKDIR="${WORKER_DIR:-$HERE}"
+
+# hf/huggingface_hub write to $HF_HOME/hub, not to $HF_CACHE — without this the
+# weights land in ~/.cache/huggingface while every later step looks in $HF_CACHE.
+export HF_HOME="$HF_CACHE"
 
 say() { echo; echo "════ $* ════"; }
 
@@ -71,9 +76,22 @@ else
 fi
 
 say "STEP 2b — sync the weights to the worker (RoCE)"
+# huggingface_hub >= 1.x keeps the bytes in a SHARED content store (hub/blobs/xx/<sha>)
+# and the repo's own blobs/ holds only relative symlinks into it. Syncing just
+# $CACHE_ENTRY ships ~1 MB of dangling links. Ship the entry plus exactly the shared
+# blobs it references (not the whole hub/ — the cache may hold unrelated models).
 ssh -o BatchMode=yes "$WORKER_ROCE_SSH_TARGET" "mkdir -p '$HF_CACHE/hub'"
-rsync -a --info=progress2 "$HF_CACHE/hub/$CACHE_ENTRY" "$WORKER_ROCE_SSH_TARGET:$HF_CACHE/hub/" \
+HUB_REAL=$(cd "$HF_CACHE/hub" && pwd -P)
+SYNC_LIST=$(mktemp)
+{
+  echo "$CACHE_ENTRY"
+  find "$HF_CACHE/hub/$CACHE_ENTRY" -type l -exec readlink -f {} + \
+    | grep "^$HUB_REAL/blobs/" | sed "s|^$HUB_REAL/||" | sort -u
+} > "$SYNC_LIST"
+echo "  $(($(wc -l < "$SYNC_LIST") - 1)) shared blobs referenced outside $CACHE_ENTRY"
+rsync -a -r --info=progress2 --files-from="$SYNC_LIST" "$HF_CACHE/hub/" "$WORKER_ROCE_SSH_TARGET:$HF_CACHE/hub/" \
   && echo "  synced $CACHE_ENTRY" || echo "  ERROR: rsync failed"
+rm -f "$SYNC_LIST"
 
 say "STEP 3 — DFlash2 draft model"
 if [ -n "$(ls -A "$DRAFT_MOUNT_DIR/$DRAFT_NAME" 2>/dev/null)" ]; then
@@ -95,10 +113,41 @@ rsync -a --info=progress2 "$DRAFT_MOUNT_DIR/$DRAFT_NAME" "$WORKER_ROCE_SSH_TARGE
   && echo "  synced $DRAFT_NAME" || echo "  ERROR: draft rsync failed"
 
 say "STEP 4 — verify both nodes"
-echo "  head:  weights=$( [ -f "$HF_CACHE/hub/$CACHE_ENTRY/snapshots/$MODEL_REVISION/config.json" ] && echo yes || echo NO )  draft=$( [ -n "$(ls -A "$DRAFT_MOUNT_DIR/$DRAFT_NAME" 2>/dev/null)" ] && echo yes || echo NO )"
-ssh -o BatchMode=yes "$WORKER_ROCE_SSH_TARGET" "
-  echo \"  worker: weights=\$( [ -f '$HF_CACHE/hub/$CACHE_ENTRY/snapshots/$MODEL_REVISION/config.json' ] && echo yes || echo NO )  draft=\$( [ -n \"\$(ls -A '$DRAFT_MOUNT_DIR/$DRAFT_NAME' 2>/dev/null)\" ] && echo yes || echo NO )\"
-" 2>/dev/null || echo "  worker: unreachable"
+# Checking that config.json exists is not enough: the snapshot dir holds only
+# symlinks, so a sync that copied the links but not the blobs behind them still
+# has config.json while every weight shard points at nothing. Instead, measure
+# what is actually there on each node and require the two to match.
+#
+# VERIFY is a small script run once on the head and once on the worker (over ssh),
+# so both sides are measured the same way. Args: $1 = weights snapshot dir,
+# $2 = draft dir. It prints one line: "<weights bytes> <broken links> <draft bytes>"
+#   b: size of the weights, following symlinks (du -L) so it counts the real
+#      blob data, not the size of the links themselves
+#   x: number of symlinks whose target is missing (find -xtype l)
+#   d: size of the draft dir (a plain copy, no symlinks to follow)
+# A missing dir yields 0 bytes rather than an empty field.
+VERIFY='S="$1"; D="$2"
+  b=$(du -sbL "$S" 2>/dev/null | cut -f1); x=$(find "$S" -xtype l 2>/dev/null | wc -l)
+  d=$(du -sb "$D" 2>/dev/null | cut -f1); echo "${b:-0} $x ${d:-0}"'
+# Head: run VERIFY locally. "_" fills $0 so the paths land in $1 and $2.
+# Results: H_W = weights bytes, H_X = broken links, H_D = draft bytes.
+read -r H_W H_X H_D <<< "$(bash -c "$VERIFY" _ "$SNAPSHOT" "$DRAFT_MOUNT_DIR/$DRAFT_NAME")"
+# Worker: send the same script over ssh (printf %q quotes it so it survives the
+# remote shell). Results go into W_W / W_X / W_D. If ssh fails, the fallback
+# "0 unreachable 0" guarantees the comparison below fails.
+read -r W_W W_X W_D <<< "$(ssh -o BatchMode=yes "$WORKER_ROCE_SSH_TARGET" \
+  "bash -c $(printf '%q' "$VERIFY") _ '$SNAPSHOT' '$DRAFT_MOUNT_DIR/$DRAFT_NAME'" 2>/dev/null || echo "0 unreachable 0")"
+echo "  head:   weights=$H_W bytes (broken links: $H_X)  draft=$H_D bytes"
+echo "  worker: weights=$W_W bytes (broken links: $W_X)  draft=$W_D bytes"
+# Pass only if: the head has weights, the worker has the same number of bytes,
+# neither side has a broken link, and the draft is present and the same size on both.
+if [ "$H_W" -gt 0 ] && [ "$H_W" = "$W_W" ] && [ "$H_X" = 0 ] && [ "$W_X" = 0 ] \
+   && [ "$H_D" -gt 0 ] && [ "$H_D" = "$W_D" ]; then
+  echo "  OK: both nodes hold identical, fully-resolved weights and draft"
+else
+  echo "  ERROR: nodes differ or links dangle — do NOT start; re-run ./download.sh"
+  exit 1
+fi
 
 echo
 echo "[glm53f] download/prep complete — next: ./start.sh"
