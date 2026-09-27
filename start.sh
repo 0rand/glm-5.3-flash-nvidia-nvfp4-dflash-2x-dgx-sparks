@@ -140,6 +140,7 @@ ASYNC_ARG="$ASYNC_ARG" EAGER_ARG="$EAGER_ARG" CUDAGRAPH_ARGS="$CUDAGRAPH_ARGS" \
       ${ATTN_BACKEND:+--attention-backend "$ATTN_BACKEND"} \
       --gpu-memory-utilization "$GMU" \
       --no-enable-flashinfer-autotune \
+      --per-request-spec-decode-metrics \
       --reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice \
       --mamba-cache-mode align \
       --enable-prefix-caching --enable-chunked-prefill \
